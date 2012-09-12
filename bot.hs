@@ -3,6 +3,7 @@ import System.IO
 import System.Random
 import System.Exit
 import Text.Printf
+import Text.Regex
 import Text.Regex.Posix
 import Data.List
 import Data.List.Split
@@ -97,10 +98,13 @@ wiki x =
     do
         dd <- getit $ "http://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=" ++ urlEncode x ++ "&rvprop=content&redirects&rvsection=0"  
         do
-            return ( parse $ getAllTextMatches(dd =~ "''' (.*)" :: AllTextMatches [] [Char] ) )
+            return ( parse $ getAllTextMatches(dd =~ "'''(.*)''' (.*)" :: AllTextMatches [] [Char] ) )
 
 parse [] = "Hmm... brontobot is unsure."
-parse (xs) = last $ splitOn "'''" $ last xs 
+parse (xs) = cleanWikiText $ last xs 
 
-
+cleanWikiText :: [Char] -> [Char]
+cleanWikiText (xs) = subRegex rx xs ""
+	where
+		rx = mkRegex "\\[|\\]|\'"
 
