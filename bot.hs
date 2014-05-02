@@ -1,132 +1,132 @@
-import Network
-import System.IO
-import System.Random
-import System.Exit
-import System.Process
-import Text.Printf
-import Text.Regex
-import Text.Regex.Posix
-import Data.List
-import Data.List.Split
-import Data.Char
-import Network.HTTP
-import Network.Browser
-import Control.Exception
-import Web.Encodings
-import Control.Monad
-import Control.Concurrent
-import Control.Exception as E
-import Control.Concurrent.STM
+{-# LANGUAGE DeriveDataTypeable, FlexibleContexts, GeneralizedNewtypeDeriving, RankNTypes, RecordWildCards, OverloadedStrings #-}
+module Main where
 
-server = "irc.freenode.org"
-ircport = 6667
--- chan = "#bitswebteam"
-chan = "#sbot-testing2"
-nick = "brontobot2"
+import Control.Concurrent         (killThread)
+import Control.Concurrent.Chan    (Chan)
+import Data.ByteString            (ByteString)
+import qualified Data.ByteString.Char8 as C
+import Data.Set                   (Set, insert)
+import Network                    (HostName, PortID(PortNumber), connectTo)
+import Network.IRC                (Message)
+import Network.IRC.Bot.BotMonad   (BotMonad(..))
+import Network.IRC.Bot.Core       (BotConf(..), User(..), nullBotConf, simpleBot)
+import Network.IRC.Bot.Log        (LogLevel(..), nullLogger, stdoutLogger)
+import Network.IRC.Bot.Part.Dice  (dicePart)
+import Network.IRC.Bot.Part.Botsnack  (snackPart)
+import Network.IRC.Bot.Part.Wisdom  (wisdomPart, sovietWisdomPart)
+import Network.IRC.Bot.Part.Hello (helloPart, byePart, chuckPart, questionPart)
+import Network.IRC.Bot.Part.Ping  (pingPart)
+import Network.IRC.Bot.Part.NickUser (nickUserPart)
+import Network.IRC.Bot.Part.Channels (initChannelsPart)
+import System.Console.GetOpt
+import System.Environment         (getArgs, getProgName)
+import System.Exit                (exitFailure)
+import System.IO                  (stdout)
 
-main = do
-    h <- connectTo server (PortNumber (fromIntegral ircport))
-    hSetBuffering h NoBuffering
-    write h "NICK" nick
-    write h "USER" (nick++" 0 * :hsbot")
-    write h "JOIN" chan
-    forkIO $ listen h
+data Flag
+    = BotConfOpt { unBotConfOpt :: (BotConf -> BotConf) }
 
-write :: Handle -> String -> String -> IO ()
-write h s t = do
-    hPrintf h "%s %s\r\n" s t
-    printf    "> %s %s\n" s t
-
-listen :: Handle -> IO ()
-listen h = forever $ do
-    t <- hGetLine h
-    let s = init t
-    if ping s 
-        then pong s 
-        else
-            if isMsg s && toMe (clean s) 
-                then speak s 
-                else eval h (clean s) 
-    putStrLn s
-  where
-    forever a = a >> forever a
-
-    ping x    = "PING :" `isPrefixOf` x
-    pong x    = write h "PONG" (':' : drop 6 x)
-    isMsg x   = "PRIVMSG" `isInfixOf` x
-    toMe x    = nick `isInfixOf` last (splitOn ":" x) || nick `isInfixOf` (last $ init (splitOn ":" x) ::[Char]) || "$" `isInfixOf` x
-    
-   
-    speak x   | isInfixOf "hello"    x  = privmsg h "I'm a brontobot." 
-              | isInfixOf "hi"       x  = privmsg h "I am brontobot, servant of the Secret Fire... wielder of the Flame of Arnor" 
-              | isInfixOf "whats up" x  = privmsg h "Not much.  I'm a brontobot." 
-              | isInfixOf "what's up"x  = privmsg h "Not a whole lot.  I'm a brontobot." 
-              | isInfixOf "self destruct"x  = do 
-                            privmsg h "Ftzzzzzzzzzz...." 
-                            threadDelay 1000000
-                            privmsg h "....zzzzzzzzzzzzzzz....." 
-                            threadDelay 2000000
-                            privmsg h "....zzzzzzzzzzzzzzzzzzzz....." 
-                            threadDelay 3000000
-                            privmsg h "....zzzzzzzzzzzzzzzzzzzzzzzzzzzzz....." 
-                            threadDelay 3500000
-                            privmsg h "plink!" 
-              | isInfixOf "$whatis " x  = 
-                        do
-                            txt <- wiki $ last $ splitOn "$whatis " x
-                            privmsg h txt 
-              | isInfixOf "$scm "x  = 
-                         do 
-                            txt <- readProcess "./commits.sh" [last $ splitOn "$scm " x] "" 
-                            privmsg h $ (last $ splitOn "$scm " x) ++ " has " ++ head (lines txt) ++ " commits"
-              | otherwise               = privmsg h $ pick x
-
-eval :: Handle -> String -> IO ()
-eval h   "!quit"                      = write h "QUIT" ":Exiting" >> exitWith ExitSuccess
-eval h x | "!id " `isPrefixOf` x      = privmsg h (drop 4 x)
-eval _  _                             = return ()
-
-clean :: String -> String
-clean c = drop 1 ( dropWhile (/=':') c)
-
-privmsg :: Handle -> String -> IO ()
-privmsg h s = write h "PRIVMSG" (chan ++ " :" ++ s)
-
--- Given an input string, (start,end), return a random Int between (start,end)
-getR :: [Char] -> (Int, Int) -> Int
-getR (_:xs) z = getR' xs 42 z
-
--- Given an input string, seed, (start,end), return a random Int between (start,end)
-getR' :: [Char] -> Int -> (Int, Int) -> Int
-getR' [x] y z = fst $ randomR z (mkStdGen (y * 9234))
-getR' (_:xs) y z = getR' xs (y + 1) z
-
--- given a given input string, return a random saying 
--- This uses some a rather lame 'ramdom' number generator
-pick :: [Char] -> [Char] 
-pick (xs) = args !! (getR xs (0, (length args) - 1) )
+botOpts :: [OptDescr Flag]
+botOpts =
+    [ Option [] ["irc-server"] (ReqArg setIrcServer "hostname or IP") "irc server to connect to"
+    , Option [] ["port"]       (ReqArg setPort      "port")           "port to connect to on server"
+    , Option [] ["nick"]       (ReqArg setNick      "name")           "irc nick"
+    , Option [] ["username"]   (ReqArg setUsername  "username")       "ident username"
+    , Option [] ["hostname"]   (ReqArg setHostname  "hostname")       "hostname of machine bot is connecting from"
+    , Option [] ["realname"]   (ReqArg setRealname  "name")           "bot's real name"
+    , Option [] ["cmd-prefix"] (ReqArg setCmdPrefix "prefix")         "prefix to bot commands (e.g., ?, @, bot: )"
+    , Option [] ["channel"]    (ReqArg addChannel   "channel name")   "channel to join after connecting. (can be specified more than once to join multiple channels)"
+    , Option [] ["log-level"]  (ReqArg setLogLevel  "debug, normal, important, quiet") "set the logging level"
+    , Option [] ["limit"]      (ReqArg setLimit     "int,int")        "enable rate limiter. burst length, delay in microseconds"
+    ]
     where
-        args = ["I'll be right there", "Sweet fancy moses!","We'll I'll be","YOU SHALL NOT PASS!!!","I think you know","It is certain","Without a doubt","Concentrate and ask again","My reply is no","Outlook not so good","So... it has come to this","So... it has come to this","So... it has come to this"]
+      setIrcServer n = BotConfOpt $ \c -> c { host = n, user = (user c) { servername = n } }
+      setPort str    = BotConfOpt $ \c -> c { port = PortNumber (fromIntegral $ read str) }
+      setNick n      = BotConfOpt $ \c -> c { nick = C.pack n }
+      setUsername n  = BotConfOpt $ \c -> c { user = (user c) { username = C.pack n } }
+      setHostname n  = BotConfOpt $ \c -> c { user = (user c) { hostname = n } }
+      setRealname n  = BotConfOpt $ \c -> c { user = (user c) { realname = (C.pack n) } }
+      setCmdPrefix p = BotConfOpt $ \c -> c { commandPrefix = p }
+      addChannel ch  = BotConfOpt $ \c -> c { channels = insert (C.pack ch) (channels c) }
+      setLogLevel l  = BotConfOpt $ \c ->
+        case l of
+          "debug"     -> c { logger = stdoutLogger Debug }
+          "normal"    -> c { logger = stdoutLogger Normal }
+          "important" -> c { logger = stdoutLogger Important }
+          "quiet"     -> c { logger = nullLogger }
+          _           -> error $ "unknown log-level: " ++ l
+      setLimit s    = BotConfOpt $ \c ->
+        case break (== ',') s of
+          (burstStr, delayStr) ->
+              case reads burstStr of
+                [(burstLen,[])] ->
+                    case reads (drop 1 $ delayStr) of
+                      [(delay,[])] ->
+                          c { limits = Just (burstLen, delay) }
+                      _ -> error $ "unabled to parse delay: " ++ delayStr
+                _ -> error $ "unabled to parse burst length: " ++ burstStr
 
+getBotConf :: Maybe (Chan Message -> IO ()) -> IO BotConf
+getBotConf mLogger =
+    do args <- getArgs
+       case getOpt Permute botOpts args of
+         (f,_,[])   ->
+             do let conf = (foldr ($) nullBotConf (map unBotConfOpt f)) { channelLogger = mLogger }
+                checkConf conf
+                return conf
+         (_,_,errs) ->
+             do progName <- getProgName
+                putStr (helpMessage progName)
+                exitFailure
 
--- getit :: [Char] -> String
-getit x = 
-    do
-        rsp <- simpleHTTP (getRequest x)
-        (getResponseBody rsp)
-   
-wiki :: [Char] -> IO [Char]
-wiki x = 
-    do
-        dd <- getit $ "http://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=" ++ urlEncode x ++ "&rvprop=content&redirects&rvsection=0"  
-        do
-            return ( parse $ getAllTextMatches(dd =~ "'''(.*)''' (.*)" :: AllTextMatches [] [Char] ) )
+exitHelp msg =
+    do progName <- getProgName
+       putStrLn msg
+       putStr (helpMessage progName)
+       exitFailure
 
-parse [] = "Hmm... brontobot is unsure."
-parse (xs) = decodeHtml $ decodeHtml $ cleanWikiText $ last xs 
+checkConf :: BotConf -> IO ()
+checkConf BotConf{..}
+    | null   host            = exitHelp "must specify --irc-server"
+    | C.null nick            = exitHelp "must specify --nick"
+    | C.null (username user) = exitHelp "must specify --username"
+    |   null (hostname user) = exitHelp "must specify --hostname"
+    | C.null (realname user) = exitHelp "must specify --realname"
+    | otherwise            = return ()
 
-cleanWikiText :: [Char] -> [Char]
-cleanWikiText (xs) = subRegex rx xs ""
-	where
-		rx = mkRegex "\\[|\\]|\'"
+helpMessage progName = usageInfo header botOpts
+  where
+  header = "Usage: "++progName++" [OPTION...]\n" ++ "e.g.\n" ++
+           progName ++ " --irc-server irc.freenode.net --nick stepbot --username stepbot --hostname happstack.com --realname \"happstack bot\" --channel \"#stepbot\""
+
+main :: IO ()
+main =
+    do botConf <- getBotConf Nothing
+       ircParts <- initParts (channels botConf)
+       (tids, reconnect) <- simpleBot botConf ircParts
+       (logger botConf) Important  "Press enter to force reconnect."
+       getLine
+       reconnect
+       (logger botConf) Important  "Press enter to quit."
+       getLine
+
+       mapM_ killThread tids
+
+initParts :: (BotMonad m) =>
+             Set ByteString  -- ^ set of channels to join
+          -> IO [m ()]
+initParts chans =
+    do (_, channelsPart) <- initChannelsPart chans
+       return [ pingPart
+              , nickUserPart
+              , channelsPart
+              , dicePart
+              , chuckPart
+              , questionPart
+              , helloPart
+              , byePart
+              , snackPart
+              , wisdomPart
+              , sovietWisdomPart
+              ]
 
